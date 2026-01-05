@@ -1,11 +1,17 @@
 /**
  * API Route for ChatGPT Scraping with Playwright
- * This handles the server-side browser automation
+ * Enhanced version with robust error handling and recovery
  */
 
 import { NextResponse } from 'next/server';
 import { chromium } from 'playwright';
 import type { ScrapedConversation } from '@/types/scraper';
+import {
+  enhancedScrape,
+  DEFAULT_SCRAPER_CONFIG,
+  type ScraperConfig,
+  type ScrapeProgress,
+} from '@/lib/scraper/enhanced-scraper';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
@@ -15,193 +21,101 @@ export async function POST(request: Request) {
   let browser;
 
   try {
-    const { maxConversations = 0 } = await request.json();
+    const {
+      maxConversations = 0,
+      config = {},
+    } = await request.json();
+
+    // Merge custom config with defaults
+    const scraperConfig: ScraperConfig = {
+      ...DEFAULT_SCRAPER_CONFIG,
+      ...config,
+    };
 
     // Launch browser (headless: false to allow user to see and login)
+    console.log('[Browser] Launching Chromium...');
     browser = await chromium.launch({
       headless: false, // User needs to see to login
       slowMo: 100, // Slow down for stability
     });
 
     const page = await browser.newPage();
-    const conversations: ScrapedConversation[] = [];
 
     // 1. Navigate to ChatGPT
+    console.log('[Navigation] Going to ChatGPT...');
     await page.goto('https://chat.openai.com', {
       waitUntil: 'networkidle',
-      timeout: 30000,
+      timeout: scraperConfig.timeout,
     });
 
-    // 2. Wait for user to login (wait for conversation links to appear)
-    console.log('Waiting for login... Please log in to ChatGPT in the browser window');
+    // 2. Wait for user to login
+    console.log('[Login] Waiting for login... Please log in to ChatGPT in the browser window');
 
     try {
-      await page.waitForSelector('nav a[href^="/c/"]', {
-        timeout: 120000, // 2 minutes for user to login
-      });
+      // Try multiple selectors for conversation links
+      const loginSelectors = [
+        'nav a[href^="/c/"]',
+        'aside a[href^="/c/"]',
+        'a[href*="/c/"]',
+      ];
+
+      let loginDetected = false;
+      for (const selector of loginSelectors) {
+        try {
+          await page.waitForSelector(selector, {
+            timeout: 120000, // 2 minutes for user to login
+          });
+          loginDetected = true;
+          console.log(`[Login] Detected using selector: ${selector}`);
+          break;
+        } catch {
+          continue;
+        }
+      }
+
+      if (!loginDetected) {
+        throw new Error('Login timeout. Please make sure you are logged in to ChatGPT.');
+      }
     } catch (error) {
       throw new Error('Login timeout. Please make sure you are logged in to ChatGPT.');
     }
 
-    console.log('Login detected! Starting to collect conversations...');
+    console.log('[Login] ✓ Login detected! Starting enhanced scrape...');
 
-    // 3. Scroll sidebar to load all conversations
-    await page.evaluate(async () => {
-      const sidebar = document.querySelector('nav') ||
-                     document.querySelector('[class*="sidebar"]') ||
-                     document.querySelector('aside');
+    // 3. Use enhanced scraper
+    const progress: ScrapeProgress = await enhancedScrape(
+      page,
+      undefined, // No progress callback in API route
+      scraperConfig
+    );
 
-      if (sidebar) {
-        let previousHeight = 0;
-        let currentHeight = sidebar.scrollHeight;
-        let attempts = 0;
-        const maxAttempts = 50;
-
-        while (currentHeight > previousHeight && attempts < maxAttempts) {
-          previousHeight = currentHeight;
-          sidebar.scrollTo(0, sidebar.scrollHeight);
-          await new Promise(r => setTimeout(r, 500));
-          currentHeight = sidebar.scrollHeight;
-          attempts++;
-        }
-      }
-    });
-
-    console.log('Finished scrolling sidebar');
-
-    // 4. Get all conversation links
-    const links = await page.evaluate(() => {
-      const convos: Array<{id: string; title: string; url: string}> = [];
-      const elements = document.querySelectorAll('nav a[href^="/c/"]');
-
-      elements.forEach(link => {
-        const href = link.getAttribute('href');
-        if (href) {
-          const id = href.match(/\/c\/([a-f0-9-]+)/)?.[1];
-          const title = link.textContent?.trim() || 'Untitled';
-          if (id) {
-            convos.push({
-              id,
-              title,
-              url: 'https://chat.openai.com' + href
-            });
-          }
-        }
-      });
-
-      // Remove duplicates
-      return [...new Map(convos.map(c => [c.id, c])).values()];
-    });
-
-    console.log(`Found ${links.length} conversations`);
-
-    // Limit if requested
-    const linksToScrape = maxConversations > 0
-      ? links.slice(0, maxConversations)
-      : links;
-
-    // 5. Scrape each conversation
-    for (let i = 0; i < linksToScrape.length; i++) {
-      const link = linksToScrape[i];
-
-      console.log(`Scraping ${i + 1}/${linksToScrape.length}: ${link.title}`);
-
-      try {
-        await page.goto(link.url, {
-          waitUntil: 'networkidle',
-          timeout: 30000,
-        });
-
-        // Wait a bit for messages to load
-        await page.waitForTimeout(1000);
-
-        const conversation = await page.evaluate(() => {
-          const url = window.location.href;
-          const id = url.match(/\/c\/([a-f0-9-]+)/)?.[1] || '';
-
-          const titleEl = document.querySelector('title');
-          const title = titleEl?.textContent?.replace(' | ChatGPT', '').trim() || 'Untitled';
-
-          const messages: any[] = [];
-
-          // Try multiple selectors for messages
-          const messageElements = document.querySelectorAll('[data-message-author-role]');
-
-          messageElements.forEach(element => {
-            const role = element.getAttribute('data-message-author-role');
-
-            // Get content element
-            const contentEl = element.querySelector('[class*="markdown"]') ||
-                            element.querySelector('.prose') ||
-                            element.querySelector('[class*="text-base"]') ||
-                            element;
-
-            let content = '';
-
-            // Extract code blocks
-            const codeBlocks: any[] = [];
-            const preElements = contentEl.querySelectorAll('pre code');
-
-            preElements.forEach((codeEl) => {
-              const code = codeEl.textContent || '';
-              const languageMatch = codeEl.className.match(/language-(\w+)/);
-              const language = languageMatch ? languageMatch[1] : 'plaintext';
-
-              codeBlocks.push({ language, code });
-            });
-
-            // Get text content
-            content = contentEl.textContent?.trim() || '';
-
-            if (content && (role === 'user' || role === 'assistant')) {
-              messages.push({
-                role,
-                content,
-                timestamp: new Date().toISOString(),
-                codeBlocks: codeBlocks.length > 0 ? codeBlocks : undefined,
-              });
-            }
-          });
-
-          return {
-            id,
-            title,
-            url,
-            messages,
-            updatedAt: new Date().toISOString()
-          };
-        });
-
-        if (conversation.messages.length > 0) {
-          conversations.push({
-            ...conversation,
-            updatedAt: new Date(conversation.updatedAt),
-          });
-          console.log(`  ✓ Scraped ${conversation.messages.length} messages`);
-        } else {
-          console.log(`  ⚠ No messages found`);
-        }
-
-        // Delay to avoid rate limiting
-        await page.waitForTimeout(1000);
-
-      } catch (error) {
-        console.error(`Error scraping conversation ${link.title}:`, error);
-        // Continue with next conversation
-      }
+    // Limit conversations if requested
+    let conversations = progress.scrapedConversations;
+    if (maxConversations > 0) {
+      conversations = conversations.slice(0, maxConversations);
     }
 
     await browser.close();
 
-    console.log(`\n✓ Scraping complete! Scraped ${conversations.length} conversations`);
+    console.log(`\n✓ Scraping complete!`);
+    console.log(`   Successfully scraped: ${progress.scrapedConversations.length}/${progress.totalConversations}`);
+    console.log(`   Failed: ${progress.failedConversations.length}`);
+    console.log(`   Total messages: ${conversations.reduce((sum, c) => sum + c.messages.length, 0)}`);
 
     return NextResponse.json({
       success: true,
       conversations,
       statistics: {
-        totalConversations: conversations.length,
+        totalConversations: progress.totalConversations,
+        successfulConversations: progress.scrapedConversations.length,
+        failedConversations: progress.failedConversations.length,
         totalMessages: conversations.reduce((sum, c) => sum + c.messages.length, 0),
-        duration: 0,
+        duration: Date.now() - progress.timestamp,
+      },
+      failed: progress.failedConversations,
+      progress: {
+        isComplete: progress.isComplete,
+        sessionId: progress.sessionId,
       }
     });
 
